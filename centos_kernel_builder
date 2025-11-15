@@ -31,7 +31,8 @@ BUILD_KERNEL=false
 BUILD_INITRAMFS=false
 DEBUG_KERNEL=false
 CONFIGURE=false
-CONFIG_FILE="none"
+BASE_CONFIG_FILE="none"
+INPUT_CONFIG_FILE=""
 GIT_CLONE=false
 MENUCONFIG=false
 RHEL_KERNEL_STREAM="y9"
@@ -43,7 +44,7 @@ KERNEL_REPO_BRANCH="main"
 CROSS_COMPILE_PREFIX=""
 EXTRA_VERSION=""
 PATCHES_DIR=""
-INPUT_CONFIG_FILE=""
+KERNEL_VERSION=""
 
 BLACK=$(tput setaf 0)
 RED=$(tput setaf 1)
@@ -71,14 +72,14 @@ usage()
     echo "  -a <x86_64|aarch64|riscv64>   Architecture"
     echo "  -b                            Build a custom kernel"
     echo "  -B                            Prepare for backporting"
-    echo "  -c                            Configure kernel (implies clean)"
+    echo "  -c                            Clean the build and configure kernel"
     echo "  -d                            DEBUG kernel"
     echo "  -e                            Extra kernel version"
     echo "  -f <fork>:<branch>            CentOS Stream kernel fork and branch"
     echo "  -g                            Git clone"
     echo "  -h                            Show help"
     echo "  -i                            Build an initramfs"
-    echo "  -I <config_file>              Input file listing kernel config options to apply"
+    echo "  -I <config_file>              Apply configs from input file"
     echo "  -m                            Run menuconfig"
     echo "  -p <patches_dir>              Patches directory"
     echo "  -r                            Build RPM packages"
@@ -102,8 +103,8 @@ parse_args ()
             e) EXTRA_VERSION="${OPTARG#*:}" ;;
             f)
                 if [[ "${OPTARG}" != *:* ]]; then
-                    echo "${RED}${BOLD}Error:${NORMAL} -f requires <kernel_repo_fork:kernel_repo_branch>"
-                    echo "Example: -f jdoe_cs10_fork:main"
+                    echo "${RED}${BOLD}Error: -f requires ${CYAN} <kernel_repo_fork:kernel_repo_branch>"
+                    echo "${NORMAL}"
                     exit 1
                 fi
                 KERNEL_REPO_FORK="${OPTARG%%:*}"
@@ -144,7 +145,7 @@ parse_args ()
                    ;;
                *)
                    echo "${RED}${BOLD}"
-                   echo >&2 "Error: Invalid RHEL_KERNEL_STREAM '${RHEL_KERNEL_STREAM}'."
+                   echo >&2 "${RED}${BOLD}Error: Invalid RHEL_KERNEL_STREAM '${RHEL_KERNEL_STREAM}'."
                    echo >&2 "       Must be one of: y9, y10, z9, z10."
                    echo "${NORMAL}"
                    exit 1
@@ -155,7 +156,8 @@ parse_args ()
                if [[ "$OPTARG" == "stable" || "$OPTARG" == "next" ]]; then
                    UPSTREAM_KERNEL_REPO="$OPTARG"
                else
-                   echo "Error: -b must be either 'stable' or 'next'"
+                   echo "${RED}${BOLD}Error: -b must be either 'stable' or 'next'"
+                   echo "${NORMAL}"
                    usage
                    exit 1
                fi
@@ -165,17 +167,16 @@ parse_args ()
     done
 }
 
-apply_kernel_configs_from_file()
+apply_configs()
 {
-    local CONFIG_FILE="$1"
-
-    if [[ ! -f "${CONFIG_FILE}" ]]; then
-        echo "${RED}${BOLD}Error:${NORMAL} config file not found: ${CONFIG_FILE}"
+    if [[ ! -f "${INPUT_CONFIG_FILE}" ]]; then
+        echo "${RED}${BOLD}Error: config file not found: ${CYAN}${INPUT_CONFIG_FILE}"
+        echo "${NORMAL}"
         exit 1
     fi
 
-    echo "${WHITE}Applying kernel config from:${NORMAL} ${CYAN}${CONFIG_FILE}${NORMAL}"
-    echo ""
+    echo "${WHITE}Applying kernel config from: ${CYAN}${INPUT_CONFIG_FILE}"
+    echo "${NORMAL}"
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         # Skip empty lines and comments
@@ -186,20 +187,43 @@ apply_kernel_configs_from_file()
         read -r action symbol value <<< "${line}"
 
         if [[ -z "${action}" || -z "${symbol}" ]]; then
-            echo "${YELLOW}Warning:${NORMAL} malformed line skipped: ${line}"
+            echo "${YELLOW}Warning: malformed line skipped: ${CYAN}${line}"
+            echo "${NORMAL}"
             continue
         fi
 
-        # Build the command
-        local cmd=( "${KERNEL_SRC_DIR}/scripts/config" --file "${KERNEL_BUILD_DIR}/.config" "--${action}" "${symbol}" )
+        # For Kconfig symbol validation, search for lines like:
+        #   config FOO
+        #   menuconfig FOO
+        local matches
+        if ! matches=$(grep -Rwl --include='Kconfig*' \
+                -e "^config[[:space:]]\+${symbol}$" \
+                -e "^menuconfig[[:space:]]\+${symbol}$" \
+                "${KERNEL_SRC_DIR}" 2>/dev/null); then
+                matches=""
+        fi
+
+        if [[ -z "${matches}" ]]; then
+            echo ""
+            echo "${RED}${BOLD}Error: Unknown Kconfig symbol: ${CYAN}${symbol}"
+            echo "${NORMAL}"
+            exit 1
+        fi
+
+        # Build scripts/config command
+        local cmd=( "${KERNEL_SRC_DIR}/scripts/config"
+                    --file "${KERNEL_BUILD_DIR}/.config"
+                    "--${action}" "${symbol}" )
+
         [[ -n "${value}" ]] && cmd+=( "${value}" )
 
-        # Apply the config
+        # Apply config
         "${cmd[@]}" || {
-            echo "${RED}${BOLD}Error:${NORMAL} failed to apply: ${line}"
+            echo "${RED}${BOLD}Error: failed to apply: ${CYAN}${line}"
+            echo "${NORMAL}"
             exit 1
         }
-    done < "${CONFIG_FILE}"
+    done < "${INPUT_CONFIG_FILE}"
 }
 
 generate_ctags()
@@ -293,7 +317,7 @@ check_dts_sanity()
         [[ -z "${dtb}" ]] && continue
         local dts_file="${dtb%.dtb}.dts"
         if [[ ! -f "${DTS_DIR}/${dts_file}" ]]; then
-            echo "${RED}Missing DTS source for: ${dtb}${NORMAL}"
+            echo "${RED}${BOLD}Missing DTS source for: ${dtb}${NORMAL}"
             MISSING=true
         fi
     done < <(
@@ -429,6 +453,8 @@ prepare_for_backporting()
         git remote add linux-next "https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git"
         git fetch linux-next "+refs/heads/*:refs/remotes/linux-next/*" "+refs/tags/*:refs/tags/*"
     fi
+
+    echo ""
 }
 
 clone_kernel_repos()
@@ -484,40 +510,50 @@ generate_config()
 {
     echo "${WHITE}Generating kernel config..."
     echo "${NORMAL}"
-    make dist-configs > /dev/null 2>&1
 
+    local distcfg_log="${KERNEL_BUILD_DIR}/dist-configs.log"
+
+    # Run dist-configs and capture all output to a log file.
+    if ! make dist-configs >"${distcfg_log}" 2>&1; then
+        echo "${RED}${BOLD}Error: make dist-configs failed:"
+        echo "${NORMAL}"
+        echo "----------------------------------------"
+        echo "${RED}${BOLD}"
+        tail -n 40 "${distcfg_log}"
+        echo "${NORMAL}"
+        exit 1
+    fi
+
+    # Select the correct base config for the stream
     case "${RHEL_KERNEL_STREAM}" in
         y9|z9)
-            CONFIG_FILE="redhat/configs/kernel-5.14.0-${TARGET_ARCH}"
+            BASE_CONFIG_FILE="redhat/configs/kernel-5.14.0-${TARGET_ARCH}"
             ;;
         y10|z10)
-            CONFIG_FILE="redhat/configs/kernel-6.12.0-${TARGET_ARCH}"
+            BASE_CONFIG_FILE="redhat/configs/kernel-6.12.0-${TARGET_ARCH}"
             ;;
         *)
-            echo "${RED}${BOLD}"
-            echo "Error: Invalid repository specified. Must be 'cs9' or 'cs10'"
-            echo "${NORMAL}"
+            echo "${RED}${BOLD}Error: Invalid kernel stream: ${RHEL_KERNEL_STREAM}${NORMAL}"
             exit 1
             ;;
     esac
 
-    # Append -debug if DEBUG_KERNEL is set to true
-    if [ "${DEBUG_KERNEL}" = "true" ]; then
-        CONFIG_FILE="${CONFIG_FILE}-debug"
+    # Append -debug if DEBUG_KERNEL is set to true.
+    if [[ "${DEBUG_KERNEL}" == "true" ]]; then
+        BASE_CONFIG_FILE="${BASE_CONFIG_FILE}-debug"
     fi
 
-    CONFIG_FILE="${CONFIG_FILE}.config"
-    echo "${WHITE}Config file: ${CYAN}${CONFIG_FILE}"
+    BASE_CONFIG_FILE="${BASE_CONFIG_FILE}.config"
+    echo "${WHITE}Base config file: ${CYAN}${BASE_CONFIG_FILE}"
     echo "${NORMAL}"
 
-    # Copy the kernel config file to .config in the build directory.
-    cp "${CONFIG_FILE}" "${KERNEL_BUILD_DIR}/.config"
+    # Copy base config file to the build directory.
+    cp "${BASE_CONFIG_FILE}" "${KERNEL_BUILD_DIR}/.config"
 }
 
 configure_kernel()
 {
-    echo "${WHITE}"
-    echo "Cleaning kernel build..."
+    echo "${WHITE}Cleaning kernel build..."
     echo "${NORMAL}"
     rm -rf ~/rpmbuild
     rm -rf "${KERNEL_BUILD_DIR}"; sync
@@ -528,7 +564,7 @@ configure_kernel()
 
     # Apply configs from input file if provided.
     if [[ -n "${INPUT_CONFIG_FILE:-}" ]]; then
-        apply_kernel_configs_from_file "${INPUT_CONFIG_FILE}"
+        apply_configs
     fi
 
     # Clean the kernel source tree.
@@ -544,7 +580,7 @@ configure_kernel()
     echo "${WHITE}Running olddefconfig..."
     echo "${NORMAL}"
     if ! make O="${KERNEL_BUILD_DIR}" ARCH="${MAKE_ARCH}" olddefconfig; then
-        echo "${RED}Error: olddefconfig failed. Aborting.${NORMAL}"
+        echo "${RED}${BOLD}Error: olddefconfig failed. Aborting.${NORMAL}"
         exit 1
     fi
 
@@ -585,7 +621,7 @@ create_log_file()
         echo "// KERNEL_BUILD_DIR = ${KERNEL_BUILD_DIR}"
         echo "// ${GCC_VERSION}"
         if [[ ${CONFIGURE} == "true" ]]; then
-            echo "// Kernel config file: ${CONFIG_FILE}"
+            echo "// Kernel config file: ${BASE_CONFIG_FILE}"
         fi
         echo "//---------------------------------------------------------------"
         echo ""
@@ -725,7 +761,7 @@ build_initramfs()
     # Build initramfs image
     sudo dracut -f "${INITRAMFS_PATH}" "${KERNEL_VERSION}" \
         --kernel-image "${KERNEL_BUILD_DIR}/arch/arm64/boot/Image" \
-        --add-drivers "nvme nvme-core xfs" \
+        --add-drivers "nvme nvme-core xfs rockchip" \
         --omit plymouth --no-hostonly \
         --kmoddir "${KERNEL_MODROOT}/lib/modules/${KERNEL_VERSION}"
 
@@ -868,7 +904,10 @@ main ()
             build_initramfs
         fi
 
-        copy_build_artifacts
+        # Copy Build artifcats.
+        if [[ "${BUILD_RESULT}" -eq 0 ]]; then
+            copy_build_artifacts
+        fi
 
         # Show build results.
         echo "" >> "${LOG_FILE}"
