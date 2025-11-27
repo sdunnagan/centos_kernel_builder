@@ -9,17 +9,8 @@
 # - KERNEL_SRC_DIR
 # - KERNEL_BUILD_DIR
 #
-# Examples:
-#
-# Clone the specified GitLab fork of the CentOS Stream kernel repo, configure,
-# prepare for backporting, and build a debug kernel:
-# $ centos_kernel_builder -a aarch64 -s y10 -g -B -f sdunnaga-12345:main -v jupiter -c -d -b
-#
-# Rebuild:
-# $ centos_kernel_builder -a aarch64 -s y10 -d -b
-#
-# Clean, configure and rebuild:
-# $ centos_kernel_builder -a aarch64 -s y10 -c -d -b
+# Example:
+# $ centos_kernel_builder -a aarch64 -s y10 -g -c -d -e chopin
 #
 # Works on Fedora 40 on x86_64 and aarch64 with gcc 14.2.1, but not Fedora 41.
 #------------------------------------------------------------------------------
@@ -27,24 +18,29 @@
 set -euo pipefail
 
 BACKPORTING=false
-BUILD_KERNEL=false
-BUILD_INITRAMFS=false
-DEBUG_KERNEL=false
-CONFIGURE=false
 BASE_CONFIG_FILE="none"
-INPUT_CONFIG_FILE=""
-GIT_CLONE=false
-MENUCONFIG=false
-RHEL_KERNEL_STREAM="y9"
-TARGET_ARCH="x86_64"
-BUILD_RPM_PACKAGES=false
-UPSTREAM_KERNEL_REPO="stable"
-KERNEL_REPO_FORK="redhat"
-KERNEL_REPO_BRANCH="main"
+BRANCH_NAME="main"
+BUILD_INITRAMFS=false
+BUILD_RESULT=0
+BUILD_RPM=false
+CONFIGURE=false
 CROSS_COMPILE_PREFIX=""
+DEBUG_KERNEL=false
+DEBUG_INITRAMFS=false
 EXTRA_VERSION=""
-PATCHES_DIR=""
+FORK_NAME="redhat"
+GIT_CLONE=false
+HOST_TO_NOTIFY=""
+INITRAMFS_FILES=()
+KERNEL_CONFIG_FILE=""
+KERNEL_DESCRIPTION=""
+KERNEL_PREFIX=""
 KERNEL_VERSION=""
+MENUCONFIG=false
+PATCHES_DIR=""
+STREAM=""
+TARGET_ARCH="x86_64"
+UPSTREAM_REPO_NAME="stable"
 
 BLACK=$(tput setaf 0)
 RED=$(tput setaf 1)
@@ -64,88 +60,100 @@ BLINK=$(tput blink)
 REVERSE=$(tput smso)
 UNDERLINE=$(tput smul)
 
+finish()
+{
+    local status="$1"   # 0 = success, non-zero = failure
+
+    if [ -n "$HOST_TO_NOTIFY" ]; then
+        local sound_file=$([[ "$status" -eq 0 ]] && \
+            echo "/usr/share/sounds/freedesktop/stereo/complete.oga" || \
+            echo "/usr/share/sounds/freedesktop/stereo/suspend-error.oga")
+        
+        ssh "$USER@$HOST_TO_NOTIFY" "paplay $sound_file" >/dev/null 2>&1
+    fi
+
+    exit "$status"
+}
+
 usage()
 {
     echo "Usage: $0 [options]"
     echo ""
     echo "Options:"
     echo "  -a <x86_64|aarch64|riscv64>   Architecture"
-    echo "  -b                            Build a custom kernel"
+    echo "  -b <branch-name>              CentOS Stream kernel fork branch"
     echo "  -B                            Prepare for backporting"
     echo "  -c                            Clean the build and configure kernel"
-    echo "  -d                            DEBUG kernel"
+    echo "  -C <kernel-config-file>       Specify file with kernel configs"
+    echo "  -d                            Build debug kernel"
+    echo "  -D                            Build debug initramfs"
     echo "  -e                            Extra kernel version"
-    echo "  -f <fork>:<branch>            CentOS Stream kernel fork and branch"
+    echo "  -f <fork-name>                CentOS Stream kernel fork"
+    echo "  -F <file-path>                initramfs files list"
     echo "  -g                            Git clone"
     echo "  -h                            Show help"
     echo "  -i                            Build an initramfs"
-    echo "  -I <config_file>              Apply configs from input file"
     echo "  -m                            Run menuconfig"
-    echo "  -p <patches_dir>              Patches directory"
+    echo "  -M <modules-list>             initramfs modules list"
+    echo "  -p <patches-dir>              Patches directory"
     echo "  -r                            Build RPM packages"
     echo "  -s <y9|y10|z9|z10>            CentOS/RHEL kernel stream (Y-stream or Z-stream)"
     echo "  -t                            RT kernel"
     echo "  -u <next|stable>              Upstream kernel repository"
     echo ""
-    exit 1
+
+    finish 1
 }
 
 parse_args ()
 {
-    while getopts "a:bBcde:f:ghiI:mp:s:tu:" opt
+    while getopts "a:b:BcC:dDe:f:F:ghimp:rs:tu:" opt
     do
         case $opt in
             a) TARGET_ARCH="$OPTARG" ;;
-            b) BUILD_KERNEL=true ;;
+            b) BRANCH_NAME="${OPTARG%%:*}" ;;
             B) BACKPORTING=true ;;
             c) CONFIGURE=true ;;
+            C) KERNEL_CONFIG_FILE="${OPTARG#*:}" ;;
             d) DEBUG_KERNEL=true ;;
+            D) DEBUG_INITRAMFS=true ;;
             e) EXTRA_VERSION="${OPTARG#*:}" ;;
-            f)
-                if [[ "${OPTARG}" != *:* ]]; then
-                    echo "${RED}${BOLD}Error: -f requires ${CYAN} <kernel_repo_fork:kernel_repo_branch>"
-                    echo "${NORMAL}"
-                    exit 1
-                fi
-                KERNEL_REPO_FORK="${OPTARG%%:*}"
-                KERNEL_REPO_BRANCH="${OPTARG#*:}"
-                ;;
+            f) FORK_NAME="${OPTARG%%:*}" ;;
+            F) INITRAMFS_FILES+=( "$OPTARG" ) ;;
             g) GIT_CLONE=true ;;
             h) usage; exit ;;
             i) BUILD_INITRAMFS=true ;;
-            I) INPUT_CONFIG_FILE="${OPTARG#*:}" ;;
             m) MENUCONFIG=true ;;
             p) PATCHES_DIR="$OPTARG" ;;
-            r) BUILD_RPM_PACKAGES=true ;;
-            s) RHEL_KERNEL_STREAM="$OPTARG"
-               case "${RHEL_KERNEL_STREAM}" in
+            r) BUILD_RPM=true ;;
+            s) STREAM="$OPTARG"
+               case "${STREAM}" in
                y9)
                    KERNEL_GROUP="centos-stream"
-                   DOWNSTREAM_KERNEL_REPO="centos-stream-9"
-                   KERNEL_DESC="CentOS Stream 9 (Y‑stream)"
+                   REPO_NAME="centos-stream-9"
+                   KERNEL_DESCRIPTION="CentOS Stream 9 (Y‑stream)"
                    KERNEL_PREFIX="cs9"
                    ;;
                y10)
                    KERNEL_GROUP="centos-stream"
-                   DOWNSTREAM_KERNEL_REPO="centos-stream-10"
-                   KERNEL_DESC="CentOS Stream 10 (Y‑stream)"
+                   REPO_NAME="centos-stream-10"
+                   KERNEL_DESCRIPTION="CentOS Stream 10 (Y‑stream)"
                    KERNEL_PREFIX="cs10"
                    ;;
                z9)
                    KERNEL_GROUP="rhel"
-                   DOWNSTREAM_KERNEL_REPO="rhel-9"
-                   KERNEL_DESC="RHEL 9 (Z‑stream)"
+                   REPO_NAME="rhel-9"
+                   KERNEL_DESCRIPTION="RHEL 9 (Z‑stream)"
                    KERNEL_PREFIX="rhel9"
                    ;;
                z10)
                    KERNEL_GROUP="rhel"
-                   DOWNSTREAM_KERNEL_REPO="rhel-10"
-                   KERNEL_DESC="RHEL 10 (Z‑stream)"
+                   REPO_NAME="rhel-10"
+                   KERNEL_DESCRIPTION="RHEL 10 (Z‑stream)"
                    KERNEL_PREFIX="rhel10"
                    ;;
                *)
-                   echo "${RED}${BOLD}"
-                   echo >&2 "${RED}${BOLD}Error: Invalid RHEL_KERNEL_STREAM '${RHEL_KERNEL_STREAM}'."
+                   echo >&2 "${RED}${BOLD}Error: Invalid STREAM '${STREAM}'."
                    echo >&2 "       Must be one of: y9, y10, z9, z10."
                    echo "${NORMAL}"
                    exit 1
@@ -154,7 +162,7 @@ parse_args ()
                ;;
             u) 
                if [[ "$OPTARG" == "stable" || "$OPTARG" == "next" ]]; then
-                   UPSTREAM_KERNEL_REPO="$OPTARG"
+                   UPSTREAM_REPO_NAME="$OPTARG"
                else
                    echo "${RED}${BOLD}Error: -b must be either 'stable' or 'next'"
                    echo "${NORMAL}"
@@ -167,15 +175,65 @@ parse_args ()
     done
 }
 
-apply_configs()
+check_args()
 {
-    if [[ ! -f "${INPUT_CONFIG_FILE}" ]]; then
-        echo "${RED}${BOLD}Error: config file not found: ${CYAN}${INPUT_CONFIG_FILE}"
+    if [[ -z "${TARGET_ARCH:-}" || -z "${STREAM:-}" ]]; then
+        echo "${RED}${BOLD}Error: TARGET_ARCH and STREAM must both be set."
         echo "${NORMAL}"
-        exit 1
+        finish 1
     fi
 
-    echo "${WHITE}Applying kernel config from: ${CYAN}${INPUT_CONFIG_FILE}"
+    if [[ ${#INITRAMFS_FILES[@]} -gt 0 ]]; then
+        for f in "${INITRAMFS_FILES[@]}"; do
+            if [[ ! -f "$f" ]]; then
+                echo "${RED}${BOLD}Error: initramfs file not found: ${CYAN}${f}"
+                echo "${NORMAL}"
+                finish 1
+            fi
+        done
+    fi
+}
+
+create_log_file()
+{
+    local GCC_VERSION
+    GCC_VERSION=$(gcc --version | head -n 1)
+
+    local DATE_STR
+    DATE_STR=$(date)
+
+    local TIMESTAMP
+    TIMESTAMP=$(date -d "today" +"%Y_%m_%d_%H%M")
+
+    mkdir -p ~/logs
+    LOG_FILE=~/logs/${KERNEL_PREFIX}_kernel_build_${TIMESTAMP}.log
+
+    {
+        echo "//---------------------------------------------------------------"
+        echo "// ${KERNEL_DESCRIPTION} build log"
+        echo "// ${DATE_STR}"
+        echo "// KERNEL_SRC_DIR =   ${KERNEL_SRC_DIR}"
+        echo "// KERNEL_BUILD_DIR = ${KERNEL_BUILD_DIR}"
+        echo "// ${GCC_VERSION}"
+        echo "//---------------------------------------------------------------"
+        echo ""
+    } > "${LOG_FILE}"
+
+    echo "${WHITE}Log file: ${CYAN}${LOG_FILE}"
+    echo "${NORMAL}"
+}
+
+apply_configs()
+{
+    if [[ ! -f "${KERNEL_CONFIG_FILE}" ]]; then
+        echo "Error: config file not found: ${KERNEL_CONFIG_FILE}" >> "${LOG_FILE}"
+        echo "${RED}${BOLD}Error: config file not found: ${CYAN}${KERNEL_CONFIG_FILE}"
+        echo "${NORMAL}"
+        finish 1
+    fi
+
+    echo "Applying kernel config from: ${KERNEL_CONFIG_FILE}" >> "${LOG_FILE}"
+    echo "${WHITE}Applying kernel config from: ${CYAN}${KERNEL_CONFIG_FILE}"
     echo "${NORMAL}"
 
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -187,9 +245,10 @@ apply_configs()
         read -r action symbol value <<< "${line}"
 
         if [[ -z "${action}" || -z "${symbol}" ]]; then
-            echo "${YELLOW}Warning: malformed line skipped: ${CYAN}${line}"
+            echo "Error: malformed line: ${line}" >> "${LOG_FILE}"
+            echo "${RED}${BOLD}Error: malformed line: ${CYAN}${line}"
             echo "${NORMAL}"
-            continue
+            finish 1
         fi
 
         # For Kconfig symbol validation, search for lines like:
@@ -204,10 +263,10 @@ apply_configs()
         fi
 
         if [[ -z "${matches}" ]]; then
-            echo ""
+            echo "Error: Unknown Kconfig symbol: ${symbol}" >> "${LOG_FILE}"
             echo "${RED}${BOLD}Error: Unknown Kconfig symbol: ${CYAN}${symbol}"
             echo "${NORMAL}"
-            exit 1
+            finish 1
         fi
 
         # Build scripts/config command
@@ -219,11 +278,12 @@ apply_configs()
 
         # Apply config
         "${cmd[@]}" || {
+            echo "Error: failed to apply: ${line}" >> "${LOG_FILE}"
             echo "${RED}${BOLD}Error: failed to apply: ${CYAN}${line}"
             echo "${NORMAL}"
-            exit 1
+            finish 1
         }
-    done < "${INPUT_CONFIG_FILE}"
+    done < "${KERNEL_CONFIG_FILE}"
 }
 
 generate_ctags()
@@ -232,47 +292,86 @@ generate_ctags()
     echo "Generating ctags..."
     echo "${NORMAL}"
 
-    # Create necessary directories
-    mkdir -p ~/tmp
-    rm -f "${KERNEL_BUILD_DIR}/tags"
+    local TAGFILE="${KERNEL_BUILD_DIR}/tags"
+    rm -f "${TAGFILE}"
 
-    # Generate tags from source directory but write to build directory.
-    # Use kernel-specific exclusions.
-    ctags --tag-relative=yes \
-          --sort=yes \
-          --recurse \
-          --links=no \
-          --languages=C,C++ \
-          --c-kinds=+p \
-          --fields=+iaS \
-          --extras=+q \
-          -f "${KERNEL_BUILD_DIR}/tags" \
-          --exclude="*.o" \
-          --exclude="*.so" \
-          --exclude="*.a" \
-          --exclude="*.bin" \
-          --exclude="*.ko" \
-          --exclude="*.mod" \
-          --exclude="*.cmd" \
-          --exclude="*.d" \
-          --exclude="*.symtypes" \
-          --exclude="*.order" \
-          --exclude=".git/*" \
-          --exclude="cscope.*" \
-          --exclude="tags*" \
-          --exclude="Module.symvers" \
-          --exclude="vmlinux*" \
-          "${KERNEL_SRC_DIR}"
+    if ! command -v ctags >/dev/null 2>&1; then
+        echo "${YELLOW}Skipping ctags: ctags not installed.${NORMAL}"
+        return 0
+    fi
 
-    if [[ $? -ne 0 ]]; then
-        echo "${RED}${BOLD}"
-        echo "Error: Failed to generate tags"
-        echo "${NORMAL}"
-        exit 1
+    local CTAGS_BIN; CTAGS_BIN=$(command -v ctags)
+
+    # Helper to detect whether an option exists
+    ctags_supports() {
+        "${CTAGS_BIN}" "$1" --help >/dev/null 2>&1
+    }
+
+    # Create ignore file in memory
+    local IGNOREFILE
+    IGNOREFILE=$(mktemp)
+    cat > "${IGNOREFILE}" << 'EOF'
+*.o
+*.so
+*.a
+*.bin
+*.ko
+*.mod
+*.cmd
+*.d
+*.symtypes
+*.order
+.git/*
+tools/*
+scripts/*
+samples/*
+Documentation/*
+cscope.*
+Module.symvers
+vmlinux*
+EOF
+
+    # Build ctags argument list dynamically
+    local CTAGS_ARGS=( -R --sort=no --tag-relative=yes -f "${TAGFILE}" )
+    CTAGS_ARGS+=( --exclude=@${IGNOREFILE} )
+    CTAGS_ARGS+=( --languages=C )
+
+    if ctags_supports --workers; then
+        CTAGS_ARGS+=( --workers="$(nproc)" )
+    fi
+    if ctags_supports --fields=+S; then
+        CTAGS_ARGS+=( --fields=+S )
+    fi
+    if ctags_supports --extras=+F; then
+        CTAGS_ARGS+=( --extras=+F )
+    fi
+    if ctags_supports --file-scope; then
+        CTAGS_ARGS+=( --file-scope=yes )
+    fi
+
+    # Source directories
+    local SOURCES=(
+        "${KERNEL_SRC_DIR}/arch/arm64"
+        "${KERNEL_SRC_DIR}/drivers"
+        "${KERNEL_SRC_DIR}/fs"
+        "${KERNEL_SRC_DIR}/kernel"
+        "${KERNEL_SRC_DIR}/mm"
+    )
+
+    # Run ctags.
+    "${CTAGS_BIN}" "${CTAGS_ARGS[@]}" "${SOURCES[@]}" \
+        2> >(grep -v 'file-scope' >&2)
+
+    local status=$?
+    rm -f "${IGNOREFILE}"
+
+    if [[ ${status} -ne 0 ]]; then
+        echo "${RED}${BOLD}Error:${NORMAL} Failed to generate tags"
+        finish 1
     fi
 }
 
-check_required_commands()
+check_commands()
 {
     local required_cmds=(
         "git" "make" "gcc" "ld" "ctags" "cpupower" "bc"
@@ -282,10 +381,9 @@ check_required_commands()
 
     for cmd in "${required_cmds[@]}"; do
         if ! command -v "${cmd}" > /dev/null 2>&1; then
-            echo "${RED}${BOLD}"
-            echo "Error: ${cmd} is required but not installed. Exiting."
+            echo "${RED}${BOLD}Error: ${cmd} is required but not installed. Exiting."
             echo "${NORMAL}"
-            exit 1
+            finish 1
         fi
     done
 }
@@ -303,13 +401,13 @@ check_dts_sanity()
     if ! command -v dtc >/dev/null 2>&1; then
         echo "${RED}${BOLD}Error: device tree compiler (dtc) not found.${NORMAL}"
         echo "Install it with: sudo dnf install dtc"
-        exit 1
+        finish 1
     fi
 
     # Ensure Makefile exists.
     if [[ ! -f "${MAKEFILE}" ]]; then
         echo "${RED}${BOLD}Error: Makefile not found in ${DTS_DIR}${NORMAL}"
-        exit 1
+        finish 1
     fi
 
     # Verify all DTB entries have a matching .dts file.
@@ -330,7 +428,7 @@ check_dts_sanity()
     if [[ "${MISSING}" == "true" ]]; then
         echo "${RED}${BOLD}DTS sanity check failed for ${DTS_DIR}.${NORMAL}"
         echo "Some DTB entries are missing corresponding .dts files."
-        exit 1
+        finish 1
     fi
 
     echo ""
@@ -356,20 +454,20 @@ apply_kernel_patches()
                 echo "Error: Failed to apply patch ${BRIGHT_BLUE}${BOLD}${PATCH_FILE}"
                 echo "${NORMAL}"
                 git am --abort
-                exit 1
+                finish 1
             }
         fi
     done
 
     if [[ "${PATCHES_FOUND}" != "true" ]]; then
-        echo "${RED}${BOLD}"
-        echo "Error: No patches found in ${BRIGHT_BLUE}${BOLD}${PATCHES_DIR}"
+        echo "${RED}${BOLD}Error: No patches found in ${BRIGHT_BLUE}${BOLD}${PATCHES_DIR}"
         echo "${NORMAL}"
-        exit 1
+        finish 1
     fi
 }
 
-set_target_architecture() {
+set_target_architecture()
+{
     case "${TARGET_ARCH}" in
         aarch64)
             MAKE_ARCH="arm64"
@@ -389,10 +487,9 @@ set_target_architecture() {
             ;;  
         x86_64) 
             if [[ "$(uname -m)" != "x86_64" ]]; then
-                echo "${RED}${BOLD}"
-                echo "Error: attempting to build for x86_64 on a non-x86_64 system."
+                echo "${RED}${BOLD}Error: attempting to build for x86_64 on a non-x86_64 system."
                 echo "${NORMAL}"
-                exit 1
+                finish 1
             fi
             MAKE_ARCH="x86_64"
             CROSS_COMPILE_PREFIX=""
@@ -400,7 +497,7 @@ set_target_architecture() {
         *) 
             echo "${RED}${BOLD}Invalid architecture specified: $TARGET_ARCH. Supported: aarch64, riscv64, x86_64."
             echo "${NORMAL}"
-            exit 1
+            finish 1
             ;;
     esac
 }
@@ -414,15 +511,15 @@ prepare_for_backporting()
     if [[ -d "${KERNEL_SRC_DIR}" ]]; then
         cd "${KERNEL_SRC_DIR}" || {
             echo "${RED}${BOLD}Error: Failed to cd into ${KERNEL_SRC_DIR}${NORMAL}"
-            exit 1
+            finish 1
         }
     else
         echo "${RED}${BOLD}Error: Kernel source directory ${KERNEL_SRC_DIR} does not exist.${NORMAL}"
-        exit 1
+        finish 1
     fi
 
     # Add CentOS/RHEL Y-stream or Z-stream kernel source repo as a remote.
-    case "${RHEL_KERNEL_STREAM}" in
+    case "${STREAM}" in
         y9)
             git remote add cs9 "https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-9.git"
             git fetch cs9
@@ -441,15 +538,15 @@ prepare_for_backporting()
             ;;
         *)
             echo "${RED}${BOLD}Error: invalid kernel source repo (must be Y-stream or Z-stream)${NORMAL}"
-            exit 1
+            finish 1
             ;;
     esac
 
     # Add upstream kernel source repo as a remote.
-    if [[ "${UPSTREAM_KERNEL_REPO}" == "stable" ]]; then
+    if [[ "${UPSTREAM_REPO_NAME}" == "stable" ]]; then
         git remote add linux-stable "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git"
         git fetch -q linux-stable
-    elif [[ "${UPSTREAM_KERNEL_REPO}" == "next" ]]; then
+    elif [[ "${UPSTREAM_REPO_NAME}" == "next" ]]; then
         git remote add linux-next "https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git"
         git fetch linux-next "+refs/heads/*:refs/remotes/linux-next/*" "+refs/tags/*:refs/tags/*"
     fi
@@ -467,7 +564,7 @@ clone_kernel_repos()
         CONFIRMATION=${CONFIRMATION:-no} # Default to 'no'
         echo "${NORMAL}"
         if [[ "$CONFIRMATION" == "yes" ]]; then
-            echo "${WHITE}Removing ${BRIGHT_BLUE}${BOLD}$KERNEL_SRC_DIR${NORMAL}..."
+            echo "${WHITE}Removing ${BRIGHT_BLUE}${BOLD}$KERNEL_SRC_DIR...${NORMAL}"
             echo "${WHITE}Removing ${BRIGHT_BLUE}${BOLD}$KERNEL_BUILD_DIR..."
             echo "${NORMAL}"
             rm -rf "${KERNEL_SRC_DIR}"
@@ -475,86 +572,124 @@ clone_kernel_repos()
         else
             echo "${WHITE}Workspace was not removed. Please reconsider your life choices."
             echo "${NORMAL}"
-            exit 1
+            finish 1
         fi
     fi
 
-    if [[ "${KERNEL_REPO_FORK}" == "redhat" ]]; then
-        # Official upstream uses nested path
-        RHEL_KERNEL_URL="https://gitlab.com/${KERNEL_REPO_FORK}/${KERNEL_GROUP}/src/kernel/${DOWNSTREAM_KERNEL_REPO}.git"
+    if [[ "${FORK_NAME}" == "redhat" ]]; then
+        RHEL_KERNEL_URL="https://gitlab.com/${FORK_NAME}/${KERNEL_GROUP}/src/kernel/${REPO_NAME}.git"
     else
-        # Forks are flattened at the project root
-        RHEL_KERNEL_URL="https://gitlab.com/${KERNEL_REPO_FORK}/${DOWNSTREAM_KERNEL_REPO}.git"
+        RHEL_KERNEL_URL="https://gitlab.com/${FORK_NAME}/${REPO_NAME}.git"
     fi
 
-    echo "${WHITE}Cloning ${KERNEL_DESC} kernel source tree...${NORMAL}"
+    echo "${WHITE}Cloning ${KERNEL_DESCRIPTION} kernel source tree...${NORMAL}"
     echo ""
 
-    # Clone the specified kernel source repository.
     git clone "${RHEL_KERNEL_URL}" "${KERNEL_SRC_DIR}" || {
-        echo >&2 "${RED}${BOLD}Error: cloning '${DOWNSTREAM_KERNEL_REPO}' failed. Check RHEL kernel URL or permissions."
+        echo >&2 "${RED}${BOLD}Error: cloning '${REPO_NAME}' failed. Check RHEL kernel URL or permissions."
         echo "${NORMAL}"
-        exit 1
+        finish 1
     }
 
     cd "${KERNEL_SRC_DIR}"
+
     echo "${WHITE}"
-    echo "Checking out branch: ${CYAN}${KERNEL_REPO_BRANCH}${NORMAL}..."
+    echo "Checking out branch: ${CYAN}${BRANCH_NAME}${NORMAL}"
     echo "${NORMAL}"
-    git checkout -b ${KERNEL_REPO_BRANCH} origin/${KERNEL_REPO_BRANCH}
+
+    git fetch origin "${BRANCH_NAME}" >/dev/null 2>&1 || {
+        echo >&2 "${RED}${BOLD}Error: remote branch '${BRANCH_NAME}' does not exist."
+        echo "${NORMAL}"
+        finish 1
+    }
+
+    git switch -C "${BRANCH_NAME}" "origin/${BRANCH_NAME}" || {
+        echo >&2 "${RED}${BOLD}Error: failed to switch to branch '${BRANCH_NAME}'."
+        echo "${NORMAL}"
+        finish 1
+    }
 
     echo "${NORMAL}"
+}
+
+select_base_config()
+{
+    local stream="$1"   # y9, y10, z9, z10
+    local arch="$2"     # aarch64, x86_64, riscv64
+
+    local pattern=""
+
+    # Select configuration family based on stream
+    case "$stream" in
+        y9|z9)
+            # kernel-5.x.x-<arch>.config
+            if [[ "$DEBUG_KERNEL" == true ]]; then
+                pattern="kernel-5.*-${arch}-debug.config"
+            else
+                pattern="kernel-5.*-${arch}.config"
+            fi
+            ;;
+        y10|z10)
+            # kernel-6.x.x-<arch>.config
+            if [[ "$DEBUG_KERNEL" == true ]]; then
+                pattern="kernel-6.*-${arch}-debug.config"
+            else
+                pattern="kernel-6.*-${arch}.config"
+            fi
+            ;;
+        *)
+            echo "Error: invalid stream '$stream' (expected y9,y10,z9,z10)" >> "${LOG_FILE}"
+            echo "${RED}${BOLD}Error: invalid stream ${CYAN}'$stream' (expected y9,y10,z9,z10)"
+            echo "${NORMAL}"
+            finish 1
+            ;;
+    esac
+
+    # Find matching config file
+    BASE_CONFIG_FILE=$(ls redhat/configs/${pattern} 2>/dev/null | head -n1)
+
+    if [[ -z "$BASE_CONFIG_FILE" ]]; then
+        echo "Error: No base config found matching pattern:" >> "${LOG_FILE}"
+        echo "${RED}${BOLD}Error: No base config found matching pattern:"
+        echo "  redhat/configs/${CYAN}${pattern}"
+        echo "${NORMAL}"
+        finish 1
+    fi
 }
 
 generate_config()
 {
-    echo "${WHITE}Generating kernel config..."
-    echo "${NORMAL}"
+    echo "${WHITE}Generating kernel config...${NORMAL}"
+    echo "Generating kernel config..." >> "${LOG_FILE}"
+    echo "" >> "${LOG_FILE}"
 
     local distcfg_log="${KERNEL_BUILD_DIR}/dist-configs.log"
 
-    # Run dist-configs and capture all output to a log file.
-    if ! make dist-configs >"${distcfg_log}" 2>&1; then
-        echo "${RED}${BOLD}Error: make dist-configs failed:"
+    if ! make "-j$(nproc)" dist-configs >> "${LOG_FILE}" 2>&1; then
+        echo "" >> "${LOG_FILE}"
+        echo "Error: make dist-configs failed" >> "${LOG_FILE}"
+        echo "${RED}${BOLD}Error: make dist-configs failed"
         echo "${NORMAL}"
-        echo "----------------------------------------"
-        echo "${RED}${BOLD}"
-        tail -n 40 "${distcfg_log}"
-        echo "${NORMAL}"
-        exit 1
+        finish 1
     fi
 
-    # Select the correct base config for the stream
-    case "${RHEL_KERNEL_STREAM}" in
-        y9|z9)
-            BASE_CONFIG_FILE="redhat/configs/kernel-5.14.0-${TARGET_ARCH}"
-            ;;
-        y10|z10)
-            BASE_CONFIG_FILE="redhat/configs/kernel-6.12.0-${TARGET_ARCH}"
-            ;;
-        *)
-            echo "${RED}${BOLD}Error: Invalid kernel stream: ${RHEL_KERNEL_STREAM}${NORMAL}"
-            exit 1
-            ;;
-    esac
-
-    # Append -debug if DEBUG_KERNEL is set to true.
-    if [[ "${DEBUG_KERNEL}" == "true" ]]; then
-        BASE_CONFIG_FILE="${BASE_CONFIG_FILE}-debug"
-    fi
-
-    BASE_CONFIG_FILE="${BASE_CONFIG_FILE}.config"
-    echo "${WHITE}Base config file: ${CYAN}${BASE_CONFIG_FILE}"
-    echo "${NORMAL}"
+    select_base_config "${STREAM}" "${TARGET_ARCH}"
+    echo "${WHITE}Base kernel config file: ${CYAN}${BASE_CONFIG_FILE}${NORMAL}"
+    echo "" >> "${LOG_FILE}"
+    echo "Base kernel config file: ${BASE_CONFIG_FILE}" >> "${LOG_FILE}"
+    echo "" >> "${LOG_FILE}"
 
     # Copy base config file to the build directory.
+    cp "${BASE_CONFIG_FILE}" "${KERNEL_BUILD_DIR}/"
     cp "${BASE_CONFIG_FILE}" "${KERNEL_BUILD_DIR}/.config"
 }
 
-configure_kernel()
+clean_and_configure()
 {
     echo "${WHITE}Cleaning kernel build..."
     echo "${NORMAL}"
+    echo "Cleaning kernel build..." >> "${LOG_FILE}"
+    echo "" >> "${LOG_FILE}"
     rm -rf ~/rpmbuild
     rm -rf "${KERNEL_BUILD_DIR}"; sync
     mkdir -p "${KERNEL_BUILD_DIR}"
@@ -563,25 +698,40 @@ configure_kernel()
     generate_config
 
     # Apply configs from input file if provided.
-    if [[ -n "${INPUT_CONFIG_FILE:-}" ]]; then
+    if [[ -n "${KERNEL_CONFIG_FILE:-}" ]]; then
         apply_configs
     fi
 
     # Clean the kernel source tree.
+    echo "" >> "${LOG_FILE}"
+    echo "Cleaning the source tree..." >> "${LOG_FILE}"
     echo "${WHITE}Cleaning the source tree..."
     echo "${NORMAL}"
     make ARCH="${MAKE_ARCH}" mrproper
 
+    # Prevent mismatched kernel version strings.
+    scripts/config --file $KERNEL_BUILD_DIR/.config \
+    --set-str LOCALVERSION "" \
+    --disable LOCALVERSION_AUTO
+
     # olddefconfig updates the config by resolving unset options and
     # reconciling configs according to the kernel’s current Kconfig
-    # dependencies and defaults — effectively enforcing consistency and
+    # dependencies and defaults, effectively enforcing consistency and
     # applying necessary corrections.
     echo ""
+    echo "" >> "${LOG_FILE}"
+    echo "Running olddefconfig..." >> "${LOG_FILE}"
     echo "${WHITE}Running olddefconfig..."
     echo "${NORMAL}"
-    if ! make O="${KERNEL_BUILD_DIR}" ARCH="${MAKE_ARCH}" olddefconfig; then
-        echo "${RED}${BOLD}Error: olddefconfig failed. Aborting.${NORMAL}"
-        exit 1
+    if ! KCONFIG_NONINTERACTIVE=1 make \
+            O="${KERNEL_BUILD_DIR}" \
+            ARCH="${MAKE_ARCH}" \
+            olddefconfig; then
+
+        echo "Error: olddefconfig failed. Aborting." >> "${LOG_FILE}"
+        echo "${RED}${BOLD}Error: olddefconfig failed. Aborting."
+        echo "${NORMAL}"
+        finish 1
     fi
 
     # Run menuconfig if requested.
@@ -599,82 +749,68 @@ configure_kernel()
     fi
 }
 
-create_log_file()
-{
-    local GCC_VERSION
-    GCC_VERSION=$(gcc --version | head -n 1)
-
-    local DATE_STR
-    DATE_STR=$(date)
-
-    local TIMESTAMP
-    TIMESTAMP=$(date -d "today" +"%Y_%m_%d_%H%M")
-
-    mkdir -p ~/logs
-    LOG_FILE=~/logs/${KERNEL_PREFIX}_kernel_build_${TIMESTAMP}.log
-
-    {
-        echo "//---------------------------------------------------------------"
-        echo "// $KERNEL_DESC build log"
-        echo "// ${DATE_STR}"
-        echo "// KERNEL_SRC_DIR =   ${KERNEL_SRC_DIR}"
-        echo "// KERNEL_BUILD_DIR = ${KERNEL_BUILD_DIR}"
-        echo "// ${GCC_VERSION}"
-        if [[ ${CONFIGURE} == "true" ]]; then
-            echo "// Kernel config file: ${BASE_CONFIG_FILE}"
-        fi
-        echo "//---------------------------------------------------------------"
-        echo ""
-    } > "${LOG_FILE}"
-}
-
 build_kernel()
 {
-    case "${RHEL_KERNEL_STREAM}" in
+    echo "" >> "${LOG_FILE}"
+
+    case "${STREAM}" in
         y9)
-            echo "${WHITE}Building CentOS Stream 9 kernel..."
+            echo "${WHITE}Building CentOS Stream 9 kernel...${NORMAL}"
+            echo "Building CentOS Stream 9 kernel..." >> "${LOG_FILE}"
             ;;
         y10)
-            echo "${WHITE}Building CentOS Stream 10 kernel..."
+            echo "${WHITE}Building CentOS Stream 10 kernel...${NORMAL}"
+            echo "Building CentOS Stream 10 kernel..." >> "${LOG_FILE}"
             ;;
         z9)
-            echo "${WHITE}Building RHEL 9 kernel..."
+            echo "${WHITE}Building RHEL 9 kernel...${NORMAL}"
+            echo "Building RHEL 9 kernel..." >> "${LOG_FILE}"
             ;;
         z10)
-            echo "${WHITE}Building RHEL 10 kernel..."
+            echo "${WHITE}Building RHEL 10 kernel...${NORMAL}"
+            echo "Building RHEL 10 kernel..." >> "${LOG_FILE}"
             ;;
         *)
-            echo "${RED}${BOLD}"
-            echo >&2 "Error: Invalid RHEL_KERNEL_STREAM '${RHEL_KERNEL_STREAM}'."
-            echo >&2 "       Must be one of: y9, y10, z9, z10."
+            echo "${RED}${BOLD}Error: Invalid STREAM '{CYAN}${STREAM}'."
             echo "${NORMAL}"
-            exit 1
+            finish 1
             ;;
     esac
-
-    echo "${WHITE}Log file: ${CYAN}${LOG_FILE}${NORMAL}"
 
     # Set identifier for the custom kernel build.
     if [ -n "${EXTRA_VERSION}" ]; then
         sed -i "s/^EXTRAVERSION.*/EXTRAVERSION = -${EXTRA_VERSION}/" "${KERNEL_SRC_DIR}/Makefile"
     fi
 
-    # Set the kernel build command.
+    # Build command setup
     if [[ -n "${CROSS_COMPILE_PREFIX}" ]]; then
-        MAKE_CMD="make -j$(nproc) O=${KERNEL_BUILD_DIR} ENABLE_WERROR= CROSS_COMPILE=${CROSS_COMPILE_PREFIX} ARCH=${MAKE_ARCH}"
+        MAKE_CMD=(
+            make -j"$(nproc)"
+            O="${KERNEL_BUILD_DIR}"
+            ENABLE_WERROR=
+            CROSS_COMPILE="${CROSS_COMPILE_PREFIX}"
+            ARCH="${MAKE_ARCH}"
+        )
     else
-        MAKE_CMD="make -j$(nproc) O=${KERNEL_BUILD_DIR} ENABLE_WERROR= ARCH=${MAKE_ARCH}"
+        MAKE_CMD=(
+            make -j"$(nproc)"
+            O="${KERNEL_BUILD_DIR}"
+            ENABLE_WERROR=
+            ARCH="${MAKE_ARCH}"
+        )
     fi
-    echo "Build command: ${MAKE_CMD}" >> "${LOG_FILE}"
+
+    echo "" >> "${LOG_FILE}"
+    echo "Build command: KCONFIG_NONINTERACTIVE=1 ${MAKE_CMD[*]}" >> "${LOG_FILE}"
     echo "" >> "${LOG_FILE}"
 
-    # Build the kernel
-    ${MAKE_CMD} >> "${LOG_FILE}" 2>&1
+    # Execute the build command
+    KCONFIG_NONINTERACTIVE=1 "${MAKE_CMD[@]}" >> "${LOG_FILE}" 2>&1
     BUILD_EXIT_STATUS=$?
     echo "" >> "${LOG_FILE}"
 
     # Build RPM packages if requested
-    if [[ "${BUILD_RPM_PACKAGES}" == "true" ]]; then
+    if [[ "${BUILD_RPM}" == "true" ]]; then
         echo "Running: make -j$(nproc) binrpm-pkg O=${KERNEL_BUILD_DIR}" >> "${LOG_FILE}"
         (
             cd "${KERNEL_SRC_DIR}" &&
@@ -690,33 +826,23 @@ build_kernel()
     BUILD_SECONDS=$((BUILD_DURATION % 60))
 
     BUILD_RESULT=1
-
     case "${TARGET_ARCH}" in
         aarch64)
             IMAGE_FILE="${KERNEL_BUILD_DIR}/arch/arm64/boot/Image"
             if [[ ${BUILD_EXIT_STATUS} -eq 0 && -f "${IMAGE_FILE}" ]]; then
-                echo "${GREEN}${BOLD}Success${NORMAL}"
                 BUILD_RESULT=0
-            else
-                echo "${RED}${BOLD}Kernel build failure${NORMAL}"
             fi
             ;;
         riscv64)
             IMAGE_FILE="${KERNEL_BUILD_DIR}/arch/riscv/boot/Image"
             if [[ ${BUILD_EXIT_STATUS} -eq 0 && -f "${IMAGE_FILE}" ]]; then
-                echo "${GREEN}${BOLD}Success${NORMAL}"
                 BUILD_RESULT=0
-            else
-                echo "${RED}${BOLD}Kernel build failure${NORMAL}"
             fi
             ;;
         x86_64)
             VMLINUX_FILE="${KERNEL_BUILD_DIR}/vmlinux"
             if [[ ${BUILD_EXIT_STATUS} -eq 0 && ( -f "${VMLINUX_FILE}" || -f "${KERNEL_SRC_DIR}/vmlinux" ) ]]; then
-                echo "${GREEN}${BOLD}Success${NORMAL}"
                 BUILD_RESULT=0
-            else
-                echo "${RED}${BOLD}Failure${NORMAL}"
             fi
             ;;
         *)
@@ -724,81 +850,230 @@ build_kernel()
             ;;
     esac
 
-    echo "" >> "${LOG_FILE}"
-    echo "//---------------------------------------------------------------" >> "${LOG_FILE}"
-
     return ${BUILD_RESULT}
 }
 
 build_initramfs()
 {
     echo ""
-    echo "${WHITE}Building initramfs${NORMAL}..."
     echo "" >> "${LOG_FILE}"
-    echo "Building initramfs..." >> "${LOG_FILE}"
+    echo "${WHITE}Building initramfs (inside CentOS Stream 10 container)...${NORMAL}"
+    echo "Building initramfs (inside CentOS Stream 10 container)..." >> "${LOG_FILE}"
     echo "" >> "${LOG_FILE}"
 
-    # Check that dracut exists on the host
-    if ! command -v dracut >/dev/null 2>&1; then
-        echo "${RED}${BOLD}Error:${NORMAL} dracut not found on host"
-        exit 1
+    if ! command -v podman >/dev/null 2>&1; then
+        echo "${RED}${BOLD}Error:${NORMAL} podman not found"
+        finish 1
     fi
 
-    # Set module staging directory (allow override, otherwise derive it)
+    # Check that kernel modules are staged.
     : "${KERNEL_MODROOT:=${KERNEL_BUILD_DIR}/modules_staging}"
 
-    mkdir -p "${KERNEL_MODROOT}"
+    if [[ ! -d "${KERNEL_MODROOT}/lib/modules" ]]; then
+        echo "${RED}${BOLD}Error:${NORMAL} kernel modules not staged (${KERNEL_MODROOT})"
+        finish 1
+    fi
 
-    # Install kernel modules into the staging directory
-    make -C "${KERNEL_SRC_DIR}" O="${KERNEL_BUILD_DIR}" \
-        INSTALL_MOD_PATH="${KERNEL_MODROOT}" modules_install \
-        >> "${LOG_FILE}" 2>&1
+    module_dirs=("${KERNEL_MODROOT}/lib/modules"/*)
+    if [[ ${#module_dirs[@]} -ne 1 ]]; then
+        echo "${RED}${BOLD}Error:${NORMAL} expected exactly 1 modules dir, found ${#module_dirs[@]}"
+        finish 1
+    fi
 
-    # Determine kernel version and output initramfs path
-    KERNEL_VERSION=$(make -sC "${KERNEL_BUILD_DIR}" kernelrelease)
+    KERNEL_VERSION=$(basename "${module_dirs[0]}")
     INITRAMFS_PATH="${KERNEL_BUILD_DIR}/initramfs-${KERNEL_PREFIX}-${KERNEL_VERSION}.img"
 
-    # Build initramfs image
-    sudo dracut -f "${INITRAMFS_PATH}" "${KERNEL_VERSION}" \
-        --kernel-image "${KERNEL_BUILD_DIR}/arch/arm64/boot/Image" \
-        --add-drivers "nvme nvme-core xfs rockchip" \
-        --omit plymouth --no-hostonly \
-        --kmoddir "${KERNEL_MODROOT}/lib/modules/${KERNEL_VERSION}"
+    BASE_ARGS=(
+        --no-hostonly
+
+        --add base
+        --add kernel-modules
+        --add udev-rules
+
+        --add systemd
+        --add systemd-initrd
+        --add dracut-systemd
+
+        --add fs-lib
+        --add rootfs-block
+    )
+
+    # Optional debugging modules
+    DEBUG_ARGS=()
+    if [[ "${DEBUG_INITRAMFS}" == true ]]; then
+        echo "Enabling debug initramfs options..." >> "${LOG_FILE}"
+        echo "${WHITE}Enabling debug initramfs options...${NORMAL}"
+
+        DEBUG_ARGS+=(
+            --add debug
+            --kernel-cmdline "console=ttyS2,1500000 rd.debug rd.shell"
+        )
+    fi
+
+    ALL_ARGS=( "${BASE_ARGS[@]}" "${DEBUG_ARGS[@]}" )
+    ALL_ARGS_STRING=$(printf " %q" "${ALL_ARGS[@]}")
+
+    # Include the specified files in the initramfs.
+    if [[ ${#INITRAMFS_FILES[@]} -gt 0 ]]; then
+        echo "Adding custom files to initramfs staging..." >> "${LOG_FILE}"
+        for src in "${INITRAMFS_FILES[@]}"; do
+            if [[ ! -f "$src" ]]; then
+                echo "Error: initramfs file not found: $src" >> "${LOG_FILE}"
+                echo "${RED}${BOLD}Error: initramfs file not found: ${CYAN}$src${NORMAL}"
+                finish 1
+            fi
+    
+            # Put them under /usr/bin inside the initramfs
+            install_path="${KERNEL_BUILD_DIR}/initramfs_extra/usr/bin"
+            mkdir -p "${install_path}"
+    
+            cp "$src" "${install_path}/" || {
+                echo "Error copying $src" >> "${LOG_FILE}"
+                finish 1
+            }
+        done
+    fi
+
+    # Run dracut inside a container.
+    echo "${WHITE}Running dracut...${NORMAL}"
+    echo "Running dracut with: ${ALL_ARGS_STRING}" >> "${LOG_FILE}"
+    if ! podman run --rm \
+        --privileged \
+        -v "${KERNEL_BUILD_DIR}:/workspace/build" \
+        -v "${KERNEL_MODROOT}/lib/modules/${KERNEL_VERSION}:/lib/modules/${KERNEL_VERSION}:ro" \
+        -w /workspace/build \
+        quay.io/centos/centos:stream10 \
+        bash -c "
+            set -euo pipefail
+            exec > >(tee /workspace/build/podman_dracut_full.log) 2>&1
+    
+            dnf -y install dracut dracut-network systemd kmod kernel-core
+    
+            if [[ ! -d /usr/lib/dracut/modules.d ]]; then
+                echo 'Error: dracut modules directory missing in container.'
+                exit 1
+            fi
+    
+            dracut -f \
+                --kver '${KERNEL_VERSION}' \
+                --kernel-image '/workspace/build/arch/${MAKE_ARCH}/boot/Image' \
+                --omit plymouth \
+                --no-early-microcode \
+                --kmoddir '/workspace/build/modules_staging/lib/modules/${KERNEL_VERSION}' \
+                '/workspace/build/initramfs-${KERNEL_PREFIX}-${KERNEL_VERSION}.img' \
+                ${ALL_ARGS_STRING} \
+                --include /workspace/build/initramfs_extra /
+        " >> "${LOG_FILE}" 2>&1
+    then
+        echo "${RED}${BOLD}Error: dracut inside container failed${NORMAL}"
+        finish 1
+    fi
 
     sudo chown "$(id -u):$(id -g)" "${INITRAMFS_PATH}" || true
 
-    # Verify initramfs image was created
     if [[ ! -f "${INITRAMFS_PATH}" ]]; then
-        echo "${RED}${BOLD}Error:${NORMAL} initramfs build failed (${INITRAMFS_PATH} not found)"
-        echo "Failure" >> "${LOG_FILE}"
-        exit 1
+        echo "${RED}${BOLD}Error:${NORMAL} initramfs not created"
+        finish 1
     fi
 
     echo "${GREEN}${BOLD}Success${NORMAL}"
+}
+
+build_dtbs()
+{
+    echo ""
+    echo "${WHITE}Building DTBs...${NORMAL}"
     echo "" >> "${LOG_FILE}"
+    echo "" >> "${LOG_FILE}"
+    echo "Building DTBs..." >> "${LOG_FILE}"
+    echo "" >> "${LOG_FILE}"
+
+    # Build DTBs.
+    make -j"$(nproc)" \
+        O="${KERNEL_BUILD_DIR}" \
+        ARCH="${MAKE_ARCH}" \
+        dtbs >> "${LOG_FILE}" 2>&1
+    if [[ $? -ne 0 ]]; then
+        echo "${RED}${BOLD}Error: DTB build failed.${NORMAL}"
+        echo "Error: DTB build failed" >> "${LOG_FILE}"
+        finish 1
+    fi
+
+    # Prepare destination path.
+    local dtb_install_path="${KERNEL_BUILD_DIR}/deploy/dtbs"
+    mkdir -p "${dtb_install_path}"
+
+    # Install DTBs.
+    make \
+        O="${KERNEL_BUILD_DIR}" \
+        ARCH="${MAKE_ARCH}" \
+        INSTALL_DTBS_PATH="${dtb_install_path}" \
+        dtbs_install >> "${LOG_FILE}" 2>&1
+    if [[ $? -ne 0 ]]; then
+        echo "${RED}${BOLD}Error: DTB install failed.${NORMAL}"
+        echo "Error: DTB install failed" >> "${LOG_FILE}"
+        finish 1
+    fi
+
+    echo "${GREEN}${BOLD}Success${NORMAL}"
 }
 
 copy_build_artifacts()
 {
     local DEPLOY_DIR="${KERNEL_BUILD_DIR}/deploy"
+    local DTBS_DIR="${DEPLOY_DIR}/dtbs"
+
+    # Preserve DTBs if they exist
+    if [[ -d "${DTBS_DIR}" ]]; then
+        local TMP_DTBS
+        TMP_DTBS=$(mktemp -d)
+        cp -a "${DTBS_DIR}" "${TMP_DTBS}/"
+    fi
+
+    # Recreate deploy directory
     rm -rf "${DEPLOY_DIR}"
     mkdir -p "${DEPLOY_DIR}"
+
+    # Restore DTBs if we saved them
+    if [[ -d "${TMP_DTBS}/dtbs" ]]; then
+        mv "${TMP_DTBS}/dtbs" "${DEPLOY_DIR}/"
+        rmdir "${TMP_DTBS}"
+    else
+        # Create an empty dtbs/ directory so caller can expect it
+        mkdir -p "${DTBS_DIR}"
+    fi
 
     local KERNEL_IMAGE_SRC="${KERNEL_BUILD_DIR}/arch/arm64/boot/Image"
     local KERNEL_IMAGE_DST="${DEPLOY_DIR}/Image-${KERNEL_PREFIX}-${KERNEL_VERSION}"
 
-    cp "${KERNEL_IMAGE_SRC}" "${KERNEL_IMAGE_DST}"
-
-    if [[ "${BUILD_INITRAMFS:-false}" == "true" ]]; then
-        cp "${INITRAMFS_PATH}" "${DEPLOY_DIR}"
+    # Copy kernel Image
+    if [[ -f "${KERNEL_IMAGE_SRC}" ]]; then
+        cp "${KERNEL_IMAGE_SRC}" "${KERNEL_IMAGE_DST}"
+    else
+        echo "${RED}${BOLD}Error:${NORMAL} kernel Image not found at ${KERNEL_IMAGE_SRC}"
+        finish 1
     fi
 
+    # Copy initramfs
+    if [[ "${BUILD_INITRAMFS:-false}" == "true" ]]; then
+        if [[ -f "${INITRAMFS_PATH}" ]]; then
+            cp "${INITRAMFS_PATH}" "${DEPLOY_DIR}/"
+        else
+            echo "${RED}${BOLD}Error:${NORMAL} initramfs was requested, but file not found:"
+            echo "  ${CYAN}${INITRAMFS_PATH}"
+            echo "${NORMAL}"
+            finish 1
+        fi
+    fi
+
+    # Output a summary
     echo ""
     echo "${WHITE}Build artifacts copied to:${CYAN}"
     echo "  ${KERNEL_IMAGE_DST}"
     if [[ "${BUILD_INITRAMFS:-false}" == "true" ]]; then
         echo "  ${INITRAMFS_PATH}"
     fi
+    echo "  ${DTBS_DIR}/ (DTBs preserved)"
     echo "${NORMAL}"
 
     {
@@ -808,6 +1083,7 @@ copy_build_artifacts()
         if [[ "${BUILD_INITRAMFS:-false}" == "true" ]]; then
             echo "  ${INITRAMFS_PATH}"
         fi
+        echo "  ${DTBS_DIR}/"
         echo ""
     } >> "${LOG_FILE}"
 }
@@ -816,10 +1092,9 @@ main ()
 {
     # Ensure required environment variables are set.
     if [[ -z "${KERNEL_SRC_DIR}" || -z "${KERNEL_BUILD_DIR}" ]]; then
-        echo "${RED}${BOLD}"
-        echo "Error: KERNEL_SRC_DIR and KERNEL_BUILD_DIR not set."
+        echo "${RED}${BOLD}Error: KERNEL_SRC_DIR and KERNEL_BUILD_DIR not set."
         echo "${NORMAL}"
-        exit 1
+        finish 1
     else
         echo ""
         echo "${WHITE}KERNEL_SRC_DIR:   ${CYAN}${KERNEL_SRC_DIR}${NORMAL}"
@@ -828,10 +1103,13 @@ main ()
     fi
 
     parse_args "$@"
+    check_args
 
-    check_required_commands
+    check_commands
 
     set_target_architecture
+
+    create_log_file
 
     # Clone the CentOS Stream kernel source repository.
     if [[ "${GIT_CLONE}" == true ]]; then
@@ -839,7 +1117,7 @@ main ()
     fi
 
     # Prepare for backporting.
-    if [[ "${BACKPORTING}" == "true" && ( "${UPSTREAM_KERNEL_REPO}" == "stable" || "${UPSTREAM_KERNEL_REPO}" == "next" ) ]]; then
+    if [[ "${BACKPORTING}" == "true" && ( "${UPSTREAM_REPO_NAME}" == "stable" || "${UPSTREAM_REPO_NAME}" == "next" ) ]]; then
         prepare_for_backporting
     fi
 
@@ -847,15 +1125,14 @@ main ()
     if [[ -d "${KERNEL_SRC_DIR}" ]]; then
         cd "${KERNEL_SRC_DIR}" || exit 1
     else
-        echo "${RED}${BOLD}"
-        echo "Error: KERNEL_SRC_DIR does not exist: ${BRIGHT_BLUE}${BOLD}${KERNEL_SRC_DIR}"
+        echo "${RED}${BOLD}Error: KERNEL_SRC_DIR does not exist: ${BRIGHT_BLUE}${BOLD}${KERNEL_SRC_DIR}"
         echo "${NORMAL}"
-        exit 1
+        finish 1
     fi
 
-    # Configure the kernel.
+    # Clean, configure and generate ctags.
     if [[ "${CONFIGURE}" == "true" ]]; then
-        configure_kernel
+        clean_and_configure
         generate_ctags
     fi
 
@@ -865,62 +1142,93 @@ main ()
     fi
 
     # Build the kernel
-    if [[ "${BUILD_KERNEL}" == "true" ]]; then
-        if [[ "${CONFIGURE}" != true ]]; then
-            if [[ ! -f "${KERNEL_BUILD_DIR}/.config" ]]; then
-                echo "${RED}${BOLD}Error: No existing .config found in ${KERNEL_BUILD_DIR}. Run with -c to configure first.${NORMAL}"
-                exit 1
-            fi
-        fi
-
-        # If this is an Orin Nano, set for performance mode.
-        if grep -q "Orin Nano" /sys/firmware/devicetree/base/model; then
-            echo "${WHITE}Setting for performance mode on Orin Nano..."
-            echo "${NORMAL}"
-            sudo cpupower frequency-set -g performance > /dev/null 2>&1
-        fi
-
-        rm -f "${KERNEL_BUILD_DIR}"/arch/arm64/boot/Image
-        rm -f "${KERNEL_BUILD_DIR}"/arch/riscv/boot/Image
-        rm -f "${KERNEL_BUILD_DIR}"/vmlinux
-
-        create_log_file
-
-        check_dts_sanity "${KERNEL_SRC_DIR}/arch/arm64/boot/dts/rockchip"
-
-        # Build the kernel.
-        START_TIME=$(date +%s)
-        BUILD_RESULT=1
-        if build_kernel; then
-            BUILD_RESULT=0
-        fi
-        END_TIME=$(date +%s)
-        BUILD_DURATION=$((END_TIME - START_TIME))
-        BUILD_MINUTES=$((BUILD_DURATION / 60))
-        BUILD_SECONDS=$((BUILD_DURATION % 60))
-
-        # Build the initramfs.
-        if [[ "${BUILD_RESULT}" -eq 0 && "${BUILD_INITRAMFS:-false}" == "true" ]]; then
-            build_initramfs
-        fi
-
-        # Copy Build artifcats.
-        if [[ "${BUILD_RESULT}" -eq 0 ]]; then
-            copy_build_artifacts
-        fi
-
-        # Show build results.
-        echo "" >> "${LOG_FILE}"
-        echo "${WHITE}Build time: ${CYAN}${BUILD_MINUTES} min, ${BUILD_SECONDS} sec${NORMAL}"
-        echo "Build time: ${BUILD_MINUTES} min, ${BUILD_SECONDS} sec" >> "${LOG_FILE}"
-        echo ""
-
-        if [[ "${BUILD_RESULT}" -ne 0 ]]; then
-            return 1
+    if [[ "${CONFIGURE}" != true ]]; then
+        if [[ ! -f "${KERNEL_BUILD_DIR}/.config" ]]; then
+            echo "${RED}${BOLD}Error: No existing .config found in ${KERNEL_BUILD_DIR}. Run with -c to configure first.${NORMAL}"
+            finish 1
         fi
     fi
 
-    return 0
+    # If this is an Orin Nano, set for performance mode.
+    if grep -q "Orin Nano" /sys/firmware/devicetree/base/model; then
+        echo "${WHITE}Setting for performance mode on Orin Nano..."
+        echo "${NORMAL}"
+        sudo cpupower frequency-set -g performance > /dev/null 2>&1
+    fi
+
+    rm -f "${KERNEL_BUILD_DIR}"/arch/arm64/boot/Image
+    rm -f "${KERNEL_BUILD_DIR}"/arch/riscv/boot/Image
+    rm -f "${KERNEL_BUILD_DIR}"/vmlinux
+
+    START_TIME=$(date +%s)
+
+    # Build the kernel.
+    BUILD_RESULT=1
+    if ! build_kernel; then
+        echo "${RED}${BOLD}Kernel build failure${NORMAL}"
+        finish 1
+    else
+        BUILD_RESULT=0
+        echo "Kernel build success" >> "${LOG_FILE}"
+        echo "" >> "${LOG_FILE}"
+        echo "${GREEN}${BOLD}Success"
+        echo "${NORMAL}"
+    
+        echo "${WHITE}Installing kernel modules...${NORMAL}"
+        echo "Installing kernel modules..." >> "${LOG_FILE}"
+        echo "" >> "${LOG_FILE}"
+    
+        # Create modules staging directory.
+        KERNEL_MODROOT="${KERNEL_BUILD_DIR}/modules_staging"
+        rm -rf "${KERNEL_MODROOT}"
+        mkdir -p "${KERNEL_MODROOT}"
+    
+        # Install modules into staging area.
+        make \
+            -j"$(nproc)" \
+            O="${KERNEL_BUILD_DIR}" \
+            ARCH="${MAKE_ARCH}" \
+            INSTALL_MOD_PATH="${KERNEL_MODROOT}" \
+            modules_install >> "${LOG_FILE}" 2>&1
+    
+        if [[ $? -ne 0 ]]; then
+            echo "${RED}${BOLD}Error: modules_install failed.${NORMAL}"
+            finish 1
+        fi
+    
+        # Fix permissions on modules directory
+        sudo chown -R "$(id -u):$(id -g)" "${KERNEL_MODROOT}" || true
+    fi
+
+    END_TIME=$(date +%s)
+    BUILD_DURATION=$((END_TIME - START_TIME))
+    BUILD_MINUTES=$((BUILD_DURATION / 60))
+    BUILD_SECONDS=$((BUILD_DURATION % 60))
+
+    # Build the initramfs.
+    if [[ "${BUILD_RESULT}" -eq 0 && "${BUILD_INITRAMFS:-false}" == "true" ]]; then
+        build_initramfs
+    fi
+
+    # Build DTBs.
+    if [[ "${BUILD_RESULT}" -eq 0 ]]; then
+        build_dtbs
+    fi
+
+    # Copy Build artifcats.
+    if [[ "${BUILD_RESULT}" -eq 0 ]]; then
+        copy_build_artifacts
+    fi
+
+    # Show build results.
+    echo "${WHITE}Build time: ${CYAN}${BUILD_MINUTES} min, ${BUILD_SECONDS} sec${NORMAL}"
+    echo "Build time: ${BUILD_MINUTES} min, ${BUILD_SECONDS} sec" >> "${LOG_FILE}"
+    echo ""
+
+    echo "${GREEN}${BOLD}Done!"
+    echo "${NORMAL}"
+
+    finish "$BUILD_RESULT"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
